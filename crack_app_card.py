@@ -134,7 +134,7 @@ def detect_card_opencv(img):
     return best
 
 
-def _card_rects(m, img_area, k):
+def _card_rects(m, img_area, k, min_fill=0.75):
     """이진 마스크에서 '카드처럼 생긴 직사각형'(비율 1.586, 꽉 찬 모양) 후보들을 점수와 함께 반환"""
     m = cv2.morphologyEx(m, cv2.MORPH_OPEN, np.ones((k, k), np.uint8))
     m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, np.ones((k * 3, k * 3), np.uint8))
@@ -150,38 +150,63 @@ def _card_rects(m, img_area, k):
             continue
         asp = max(w, h) / min(w, h)
         fill = a / (w * h)                 # 직사각형에 얼마나 꽉 차는지
-        if fill < 0.75 or abs(asp - CARD_RATIO) > 0.35:
+        if fill < min_fill or abs(asp - CARD_RATIO) > 0.35:
             continue
         out.append((abs(asp - CARD_RATIO) + (1 - fill), order_corners(cv2.boxPoints(rect))))
     return out
 
 
+def _touches_border(q, shape, margin=0.01):
+    H, W = shape[:2]
+    m = margin * min(H, W)
+    return bool((q[:, 0] < m).any() or (q[:, 1] < m).any() or (q[:, 0] > W - 1 - m).any() or (q[:, 1] > H - 1 - m).any())
+
+
 def detect_card_contrast(img):
-    """배경(콘크리트)과 '다르게 보이는' 직사각형을 카드 후보로 찾음.
-    ① 채도가 높다 → 유채색 카드(파랑·노랑 등)
+    """배경과 '다르게 보이는' 직사각형을 카드 후보로 찾음.
+    ① 채도가 높다 → 유채색 카드
     ② 배경보다 훨씬 어둡다 → 검정 카드
-    ③ 배경보다 훨씬 밝다 → 흰색 카드
-    반환: [(꼭짓점 4개, 검출 종류), ...]  (그럴듯한 순서, 같은 물체 중복 제거)"""
-    hsv = cv2.cvtColor(img, cv2.COLOR_RGB2HSV)
-    S = hsv[..., 1]
+    ③ 배경보다 훨씬 밝다(무채색) → 흰색 카드
+    ④ 배경보다 밝거나 색이 진하다 → 그라데이션·투톤 카드(한쪽은 분홍, 한쪽은 흰색 등)
+    - 사진 가장자리에 걸린 사각형은 제외 (잘린 물체는 기준으로 쓸 수 없음)
+    - 같은 물체를 가리키는 후보가 여럿이면 하나만 남김 (테두리가 더 뚜렷하거나, 카드 일부가 아닌 전체인 쪽)
+    반환: [(꼭짓점 4개, 검출 종류), ...]"""
+    H, W = img.shape[:2]
+    S = cv2.cvtColor(img, cv2.COLOR_RGB2HSV)[..., 1]
     gray = cv2.GaussianBlur(cv2.cvtColor(img, cv2.COLOR_RGB2GRAY), (5, 5), 0).astype(np.int16)
     low_sat = S < 60
     bg = float(np.median(gray[low_sat])) if low_sat.mean() > 0.2 else float(np.median(gray))  # 벽 밝기
-    k = max(3, (min(img.shape[:2]) // 150) | 1)
-    img_area = img.shape[0] * img.shape[1]
+    k = max(3, (min(H, W) // 150) | 1)
+    img_area = H * W
 
+    # (종류, 마스크들, 최소 채움 비율) — 투톤 카드는 색 경계에서 마스크가 조금 비므로 기준을 약간 완화
     tests = [("유채색 카드(채도)", [(S > t) for t in (170, 140, 110, 80)]),
              ("검정 카드(배경보다 어두움)", [(gray < bg - d) & (S < 120) for d in (70, 50, 35)]),
-             ("흰색 카드(배경보다 밝음)", [(gray > bg + d) & (S < 60) for d in (50, 35, 22)])]
-    found = []
-    for kind, masks in tests:
+             ("흰색 카드(배경보다 밝음)", [(gray > bg + d) & (S < 60) for d in (50, 35, 22)]),
+             ("투톤·그라데이션 카드(배경보다 밝거나 색이 진함)",
+              [(gray > bg + d) | ((S > t) & (gray > bg + 5)) for d, t in ((60, 120), (45, 90), (30, 70))], 0.65)]
+    emap = edge_map(img)
+    found = []                              # [꼭짓점, 종류, 테두리 점수]
+    for kind, masks, *opt in tests:
+        min_fill = opt[0] if opt else 0.75
         for m in masks:                     # 엄격한 기준 → 느슨한 기준 순서
-            for score, q in sorted(_card_rects(m.astype(np.uint8), img_area, k), key=lambda x: x[0]):
-                c = q.mean(axis=0)
-                size = np.linalg.norm(q[0] - q[2])
-                if all(np.linalg.norm(c - f[0].mean(axis=0)) > 0.3 * size for f in found):
-                    found.append((q, kind))
-    return found
+            for _, q in _card_rects(m.astype(np.uint8), img_area, k, min_fill):
+                if _touches_border(q, img.shape):
+                    continue
+                s = edge_score(emap, refine_quad(img, q)[0])
+                same = [f for f in found if _overlaps(f[0], q)]
+                if not same:
+                    found.append([q, kind, s])
+                    continue
+                f = same[0]
+                bigger = cv2.contourArea(q) > 1.2 * cv2.contourArea(f[0])
+                # 같은 물체를 가리키는 후보끼리 비교:
+                #  - 테두리가 확실히 더 뚜렷하면 교체
+                #  - 더 크고(기존 후보를 감싸고) 테두리도 비슷하게 뚜렷하면 교체
+                #    → 카드의 '일부'(그라데이션 카드의 분홍 부분 등)보다 카드 '전체'를 선택
+                if s > f[2] * 1.2 or (bigger and s > f[2] * 0.9):
+                    f[:] = [q, kind, s]
+    return [(q, kind) for q, kind, _ in found]
 
 
 def _fit_line_robust(pts, iters=4):
