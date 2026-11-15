@@ -142,7 +142,7 @@ def _card_rects(m, img_area, k, min_fill=0.75):
     out = []
     for c in cnts:
         a = cv2.contourArea(c)
-        if a < 0.003 * img_area or a > 0.5 * img_area:
+        if a < 0.008 * img_area or a > 0.5 * img_area:    # 사진의 0.8% 미만은 IC칩·로고 같은 작은 사각형으로 보고 제외
             continue
         rect = cv2.minAreaRect(cv2.convexHull(c))
         w, h = rect[1]
@@ -162,12 +162,47 @@ def _touches_border(q, shape, margin=0.01):
     return bool((q[:, 0] < m).any() or (q[:, 1] < m).any() or (q[:, 0] > W - 1 - m).any() or (q[:, 1] > H - 1 - m).any())
 
 
+def extend_partial_card(img, emap, q, gain=1.1):
+    """카드의 '일부'만 사각형으로 잡혔을 때(투톤 카드의 한쪽 면 등), 카드 가로세로비 1.586을 이용해
+    나머지 부분을 연장해 본 사각형들 중 네 변의 테두리가 가장 뚜렷한 것을 선택.
+    예) 세로 172px짜리 갈색 면만 잡힘 → 그 변을 카드의 짧은 변으로 보고 가로를 172×1.586로 늘려 봄"""
+    q = order_corners(q)
+    u = q[1] - q[0]                     # 위쪽 변 방향
+    v = q[3] - q[0]                     # 왼쪽 변 방향
+    a, b = np.linalg.norm(u), np.linalg.norm(v)
+    if a < 1 or b < 1:
+        return q, False
+    u, v = u / a, v / b
+    hyps = []
+    for side, other, d_side, d_other in ((b, a, v, u), (a, b, u, v)):
+        for target in (side * CARD_RATIO, side / CARD_RATIO):   # 이 변이 카드의 짧은 변 / 긴 변이라고 가정
+            if target <= other * 1.15:                          # 실제로 '늘리는' 경우만
+                continue
+            ext = (target - other) * d_other
+            if d_other is u:   # 왼쪽 또는 오른쪽으로 연장
+                hyps += [np.array([q[0], q[1] + ext, q[2] + ext, q[3]]), np.array([q[0] - ext, q[1], q[2], q[3] - ext])]
+            else:              # 위 또는 아래로 연장
+                hyps += [np.array([q[0], q[1], q[2] + ext, q[3] + ext]), np.array([q[0] - ext, q[1] - ext, q[2], q[3]])]
+    best_q, best_s = q, edge_score(emap, q)
+    changed = False
+    for h in hyps:
+        h = h.astype(np.float32)
+        if _touches_border(h, img.shape):
+            continue
+        rh, _ = refine_quad(img, h)
+        sh = edge_score(emap, rh)
+        if sh > best_s * gain:
+            best_q, best_s, changed = rh, sh, True
+    return best_q, changed
+
+
 def detect_card_contrast(img):
     """배경과 '다르게 보이는' 직사각형을 카드 후보로 찾음.
     ① 채도가 높다 → 유채색 카드
     ② 배경보다 훨씬 어둡다 → 검정 카드
     ③ 배경보다 훨씬 밝다(무채색) → 흰색 카드
     ④ 배경보다 밝거나 색이 진하다 → 그라데이션·투톤 카드(한쪽은 분홍, 한쪽은 흰색 등)
+    ⑤ 배경과 밝기가 다르거나(밝든 어둡든) 색이 진하다 → 밝은 면과 어두운 면이 섞인 투톤 카드(베이지+갈색 등)
     - 사진 가장자리에 걸린 사각형은 제외 (잘린 물체는 기준으로 쓸 수 없음)
     - 같은 물체를 가리키는 후보가 여럿이면 하나만 남김 (테두리가 더 뚜렷하거나, 카드 일부가 아닌 전체인 쪽)
     반환: [(꼭짓점 4개, 검출 종류), ...]"""
@@ -184,7 +219,9 @@ def detect_card_contrast(img):
              ("검정 카드(배경보다 어두움)", [(gray < bg - d) & (S < 120) for d in (70, 50, 35)]),
              ("흰색 카드(배경보다 밝음)", [(gray > bg + d) & (S < 60) for d in (50, 35, 22)]),
              ("투톤·그라데이션 카드(배경보다 밝거나 색이 진함)",
-              [(gray > bg + d) | ((S > t) & (gray > bg + 5)) for d, t in ((60, 120), (45, 90), (30, 70))], 0.65)]
+              [(gray > bg + d) | ((S > t) & (gray > bg + 5)) for d, t in ((60, 120), (45, 90), (30, 70))], 0.65),
+             ("투톤 카드(밝은 면 + 어둡고 진한 면)",
+              [(np.abs(gray - bg) > d) | (S > t) for d, t in ((50, 150), (35, 120), (25, 100))], 0.65)]
     emap = edge_map(img)
     found = []                              # [꼭짓점, 종류, 테두리 점수]
     for kind, masks, *opt in tests:
@@ -193,6 +230,7 @@ def detect_card_contrast(img):
             for _, q in _card_rects(m.astype(np.uint8), img_area, k, min_fill):
                 if _touches_border(q, img.shape):
                     continue
+                q, _ = extend_partial_card(img, emap, q)       # 카드 일부만 잡혔으면 비율 1.586으로 연장
                 s = edge_score(emap, refine_quad(img, q)[0])
                 same = [f for f in found if _overlaps(f[0], q)]
                 if not same:
@@ -204,7 +242,8 @@ def detect_card_contrast(img):
                 #  - 테두리가 확실히 더 뚜렷하면 교체
                 #  - 더 크고(기존 후보를 감싸고) 테두리도 비슷하게 뚜렷하면 교체
                 #    → 카드의 '일부'(그라데이션 카드의 분홍 부분 등)보다 카드 '전체'를 선택
-                if s > f[2] * 1.2 or (bigger and s > f[2] * 0.9):
+                much_bigger = cv2.contourArea(q) > 3 * cv2.contourArea(f[0])   # 칩·로고·카드 절반 → 카드 전체
+                if s > f[2] * 1.2 or (bigger and s > f[2] * 0.9) or (much_bigger and s > f[2] * 0.6):
                     f[:] = [q, kind, s]
     return [(q, kind) for q, kind, _ in found]
 
@@ -348,6 +387,8 @@ def fit_card_rect(emap, q0):
                 for sgn in (1, -1):
                     t = p.copy()
                     t[k] += sgn * steps[k]
+                    if not (0.7 * long0 <= t[2] <= 1.6 * long0):   # 처음 크기에서 너무 벗어나지 않게
+                        continue
                     st_ = edge_score(emap, _rect_quad(*t))
                     if st_ > s:
                         p, s, improved = t, st_, True
@@ -499,6 +540,8 @@ if up is not None:
             card_q, box_q = detect_card_yolo(img, card_conf) if model_card else (None, None)
             method = "YOLO 카드 모델 (모서리 키포인트)"
             cands = detect_card_contrast(img)              # 유채색·검정·흰색 카드 후보
+            if card_q is not None and cv2.contourArea(card_q) < 0.008 * img.shape[0] * img.shape[1]:
+                card_q = None                              # IC칩처럼 너무 작은 사각형은 카드가 아님
             if card_q is not None and use_refine:
                 # YOLO 모서리 교차 검증: 같은 카드를 가리키는 대비 검출 결과가 있으면
                 # 네 변이 실제 경계선 위에 더 잘 놓인 쪽을 채택 (학습 안 된 카드에서 모서리가 틀리는 문제 방지)
@@ -509,7 +552,8 @@ if up is not None:
                     if _overlaps(cq, card_q):
                         rq, _ = refine_quad(img, cq)
                         sc = edge_score(emap, rq)
-                        if sc > best_s * 1.2:
+                        much_bigger = cv2.contourArea(cq) > 3 * cv2.contourArea(best_q)
+                        if sc > best_s * 1.2 or (much_bigger and sc > best_s * 0.6):
                             best_q, best_s = cq, sc
                             method = f"대비 기반 검출 – {kind} (YOLO 모서리가 부정확해 교체)"
                 card_q = best_q
