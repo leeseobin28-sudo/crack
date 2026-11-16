@@ -196,6 +196,45 @@ def extend_partial_card(img, emap, q, gain=1.1):
     return best_q, changed
 
 
+def card_from_corners(img, emap, m, k):
+    """카드가 손 등 다른 물체와 붙어 한 덩어리로 잡혀 직사각형이 안 될 때:
+    덩어리 윤곽에서 '두 변이 길고 거의 직각인 모서리'를 찾아, 그 모서리에서 카드 비율(1.586) 직사각형을
+    가정해 본 뒤 네 변이 실제 테두리 위에 가장 잘 놓이는 것을 고름 (손에 가려지지 않은 카드 모서리를 이용)"""
+    H, W = img.shape[:2]
+    mm = cv2.morphologyEx(m.astype(np.uint8), cv2.MORPH_OPEN, np.ones((k, k), np.uint8))
+    mm = cv2.morphologyEx(mm, cv2.MORPH_CLOSE, np.ones((k * 3, k * 3), np.uint8))
+    cnts, _ = cv2.findContours(mm, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    min_len = 0.06 * min(H, W)
+    best, best_s = None, 0.0
+    for c in cnts:
+        if cv2.contourArea(c) < 0.008 * H * W:
+            continue
+        poly = cv2.approxPolyDP(c, 0.01 * cv2.arcLength(c, True), True).reshape(-1, 2).astype(np.float32)
+        n = len(poly)
+        if n < 3:
+            continue
+        for i in range(n):
+            p, a, b = poly[i], poly[i - 1], poly[(i + 1) % n]
+            u, v = a - p, b - p
+            lu, lv = np.linalg.norm(u), np.linalg.norm(v)
+            if lu < min_len or lv < min_len:
+                continue
+            u, v = u / lu, v / lv
+            if abs(np.dot(u, v)) > 0.26:                      # 내각 75°~105°만
+                continue
+            for su, sv in ((lu, lu / CARD_RATIO), (lu, lu * CARD_RATIO), (lv * CARD_RATIO, lv), (lv / CARD_RATIO, lv)):
+                q = np.array([p, p + su * u, p + su * u + sv * v, p + sv * v], np.float32)
+                if _touches_border(q, img.shape) or cv2.contourArea(q) < 0.008 * H * W:
+                    continue
+                rq, _ = refine_quad(img, q)
+                if not is_card_shape(rq):
+                    continue
+                s = edge_score(emap, rq)
+                if s > best_s:
+                    best, best_s = order_corners(rq), s
+    return best
+
+
 def detect_card_contrast(img):
     """배경과 '다르게 보이는' 직사각형을 카드 후보로 찾음.
     ① 채도가 높다 → 유채색 카드
@@ -205,6 +244,7 @@ def detect_card_contrast(img):
     ⑤ 배경과 밝기가 다르거나(밝든 어둡든) 색이 진하다 → 밝은 면과 어두운 면이 섞인 투톤 카드(베이지+갈색 등)
     - 사진 가장자리에 걸린 사각형은 제외 (잘린 물체는 기준으로 쓸 수 없음)
     - 같은 물체를 가리키는 후보가 여럿이면 하나만 남김 (테두리가 더 뚜렷하거나, 카드 일부가 아닌 전체인 쪽)
+    - 하나도 못 찾으면(손과 카드가 한 덩어리로 붙은 경우) 카드 모서리 기반으로 다시 찾음
     반환: [(꼭짓점 4개, 검출 종류), ...]"""
     H, W = img.shape[:2]
     S = cv2.cvtColor(img, cv2.COLOR_RGB2HSV)[..., 1]
@@ -245,6 +285,17 @@ def detect_card_contrast(img):
                 much_bigger = cv2.contourArea(q) > 3 * cv2.contourArea(f[0])   # 칩·로고·카드 절반 → 카드 전체
                 if s > f[2] * 1.2 or (bigger and s > f[2] * 0.9) or (much_bigger and s > f[2] * 0.6):
                     f[:] = [q, kind, s]
+    if not found:
+        # 카드가 손과 붙어 한 덩어리가 되면 위 방법으로는 직사각형이 안 나옴
+        # → 손에 가려지지 않은 카드 모서리(길고 직각인 두 변)에서 카드 비율 직사각형을 가정해 찾음
+        best, best_s = None, 0.0
+        for kind, masks, *opt in tests[3:]:
+            for m in masks:
+                q = card_from_corners(img, emap, m, k)
+                if q is not None and edge_score(emap, q) > best_s:
+                    best, best_s = q, edge_score(emap, q)
+        if best is not None:
+            found.append([best, "손에 든 카드(가려지지 않은 모서리 기반)", best_s])
     return [(q, kind) for q, kind, _ in found]
 
 
@@ -523,6 +574,11 @@ with st.expander("📷 촬영 가이드", expanded=False):
 
 if up is not None:
     image = ImageOps.exif_transpose(Image.open(up))
+    # 휴대폰 원본(약 4000×3000, 1200만 화소)을 그대로 처리하면 무료 서버 메모리(약 1GB)를 넘겨 앱이 꺼짐
+    # → 긴 변을 1600px로 줄여서 처리 (카드도 같이 줄어들어 mm 환산 비율은 그대로 유지됨)
+    MAX_SIDE = 1600
+    if max(image.size) > MAX_SIDE:
+        image.thumbnail((MAX_SIDE, MAX_SIDE), Image.LANCZOS)
     img = np.array(image.convert("RGB"))
 
     c1, c2 = st.columns(2)
@@ -547,6 +603,7 @@ if up is not None:
                 # 네 변이 실제 경계선 위에 더 잘 놓인 쪽을 채택 (학습 안 된 카드에서 모서리가 틀리는 문제 방지)
                 emap = edge_map(img)
                 yq, _ = refine_quad(img, card_q)
+                yq, _ = make_card_shape(img, emap, yq)     # YOLO 결과도 카드 모양으로 다듬은 뒤 비교
                 best_q, best_s = card_q, edge_score(emap, yq)
                 for cq, kind in cands:
                     if _overlaps(cq, card_q):
@@ -627,4 +684,4 @@ if up is not None:
         diff = abs(area_ratio_mm2 - area_h_mm2) / max(area_h_mm2, 1e-6) * 100
         st.caption(f"두 방식 차이 {diff:.1f}% — 차이가 크면 사진이 비스듬하다는 뜻이며, 원근 보정 값을 사용하세요.")
 
-# 실행: cd ~/Desktop → streamlit run crack_app_card.py
+# 실행: cd ~/Desktop/crack → streamlit run crack_app_card.py
